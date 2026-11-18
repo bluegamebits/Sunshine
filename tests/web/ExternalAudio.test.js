@@ -42,6 +42,9 @@ describe('externally managed audio configuration', () => {
       'install_steam_audio_drivers',
       'stream_audio',
       'external_audio',
+      'mic_passthrough',
+      'mic_device',
+      'mic_set_default',
     ])
     expect(config.external_audio).toBe('disabled')
     expect(wrapper.get('#external_audio').element.checked).toBe(false)
@@ -57,6 +60,25 @@ describe('externally managed audio configuration', () => {
     expect(wrapper.find('#external_audio').exists()).toBe(false)
     expect(wrapper.find('#stream_audio').exists()).toBe(true)
     wrapper.unmount()
+  })
+
+  it('shows microphone passthrough options on Windows and Linux only', () => {
+    const windows = mountAudioVideo('windows')
+    expect(windows.config.mic_passthrough).toBe('enabled')
+    expect(windows.config.mic_set_default).toBe('enabled')
+    expect(windows.config.mic_device).toBe('')
+    expect(windows.wrapper.get('#mic_passthrough').element.checked).toBe(true)
+    windows.wrapper.unmount()
+
+    const linux = mountAudioVideo('linux')
+    expect(linux.wrapper.find('#mic_passthrough').exists()).toBe(true)
+    expect(linux.wrapper.find('#mic_set_default').exists()).toBe(true)
+    expect(linux.wrapper.find('#mic_device').exists()).toBe(false)
+    linux.wrapper.unmount()
+
+    const macos = mountAudioVideo('macos')
+    expect(macos.wrapper.find('#mic_passthrough').exists()).toBe(false)
+    macos.wrapper.unmount()
   })
 
   it('provides the standard documentation table and a working configuration shortcut', () => {
