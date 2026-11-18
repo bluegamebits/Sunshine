@@ -1627,6 +1627,48 @@ namespace stream {
     observer.join();
     return matched;
   }
+
+  /**
+   * @brief Exercise production microphone packet routing on a loopback audio socket.
+   * @param packet Raw packet sent to the audio socket.
+   * @param session_id Session ID registered to receive microphone packets.
+   * @return Packet delivered to the registered microphone queue, or `std::nullopt` if none arrived.
+   */
+  std::optional<std::string> test_route_mic_packet(const std::string &packet, const std::string &session_id) {
+    broadcast_ctx_t ctx;
+    const auto loopback = asio::ip::address_v4::loopback();
+    ctx.video_sock.open(udp::v4());
+    ctx.audio_sock.open(udp::v4());
+    ctx.video_sock.bind(udp::endpoint {loopback, 0});
+    ctx.audio_sock.bind(udp::endpoint {loopback, 0});
+    ctx.message_queue_queue = std::make_shared<message_queue_queue_t::element_type>(4);
+
+    auto queue = std::make_shared<mic_queue_t::element_type>(4);
+    {
+      auto lg = ctx.mic_queues.lock();
+      ctx.mic_queues->insert_or_assign(session_id, queue);
+    }
+
+    udp::socket sender {ctx.io_context, udp::endpoint {loopback, 0}};
+    sender.send_to(asio::buffer(packet), ctx.audio_sock.local_endpoint());
+
+    auto shutdown = mail::man->event<bool>(mail::broadcast_shutdown);
+    shutdown->reset();
+    auto reset_shutdown = util::fail_guard([&shutdown]() {
+      shutdown->reset();
+    });
+    std::optional<std::string> received;
+    std::jthread observer {[&]() {
+      if (auto delivered = queue->pop(500ms)) {
+        received = std::move(*delivered);
+      }
+      shutdown->raise(true);
+      ctx.io_context.stop();
+    }};
+    recvThread(ctx);
+    observer.join();
+    return received;
+  }
 #endif
 
   /**
@@ -2336,7 +2378,7 @@ namespace stream {
 
     while_starting_do_nothing(session->state);
 
-    auto &ctx = *session->broadcast_ref;
+    auto &ctx = *session->broadcast_ref.get();
     auto session_id = session->audio.ping_payload;
     auto queue = std::make_shared<mic_queue_t::element_type>(32);
     {
