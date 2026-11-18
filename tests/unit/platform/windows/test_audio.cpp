@@ -8,12 +8,17 @@
 
 #ifdef _WIN32
   // standard includes
+  #include <algorithm>
   #include <array>
   #include <cstdlib>
   #include <cstring>
   #include <functional>
+  #include <optional>
+  #include <string>
   #include <tuple>
   #include <type_traits>
+  #include <utility>
+  #include <vector>
 
   // platform includes
   #include <mmdeviceapi.h>
@@ -33,6 +38,10 @@ namespace platf::audio::tests {
   bool microphone_available(const std::string &assigned_sink, const std::string &configured_sink, IMMDeviceEnumerator *device_enum);
   bool capture_follows_default_device(IMMDeviceEnumerator *device_enum, IMMDevice *capture_device);
   capture_e simulate_default_device_change(bool follows_default_device, bool install_callback, bool render_device_changed, int &callback_count);
+  std::optional<WAVEFORMATEXTENSIBLE> endpoint_waveformat(const WAVEFORMATEX *format, std::size_t size);
+  bool same_waveformat_layout(const WAVEFORMATEXTENSIBLE &a, const WAVEFORMATEXTENSIBLE &b);
+  std::vector<std::pair<WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE>> virtual_mic_format_pairs(const WAVEFORMATEXTENSIBLE &render, const WAVEFORMATEXTENSIBLE &capture);
+  std::string pretty_waveformat(const WAVEFORMATEXTENSIBLE &waveformat);
 }  // namespace platf::audio::tests
 
 namespace {
@@ -588,5 +597,138 @@ TEST(WindowsAudioTest, DefaultChangeWithoutCallbackStillReinitializes) {
     platf::capture_e::reinit
   );
   EXPECT_EQ(callback_count, 0);
+}
+
+namespace {
+  /**
+   * @brief Build an endpoint format the way Windows reports a plain one.
+   *
+   * @param tag Format tag.
+   * @param channels Channel count.
+   * @param rate Sample rate in Hz.
+   * @param bits Bits per sample.
+   * @return Extensible endpoint format.
+   */
+  WAVEFORMATEXTENSIBLE endpoint_format(WORD tag, WORD channels, DWORD rate, WORD bits) {
+    WAVEFORMATEX format {};
+    format.wFormatTag = tag;
+    format.nChannels = channels;
+    format.nSamplesPerSec = rate;
+    format.wBitsPerSample = bits;
+    format.nBlockAlign = channels * bits / 8;
+    format.nAvgBytesPerSec = rate * format.nBlockAlign;
+    return platf::audio::tests::endpoint_waveformat(&format, sizeof(format)).value();
+  }
+}  // namespace
+
+TEST(WindowsAudioTest, ConvertsEndpointFormatsToExtensible) {
+  const auto mono = endpoint_format(WAVE_FORMAT_IEEE_FLOAT, 1, 44100, 32);
+  EXPECT_EQ(mono.Format.wFormatTag, WAVE_FORMAT_EXTENSIBLE);
+  EXPECT_EQ(mono.Format.cbSize, sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX));
+  EXPECT_EQ(mono.Samples.wValidBitsPerSample, 32);
+  EXPECT_EQ(mono.SubFormat.Data1, WAVE_FORMAT_IEEE_FLOAT);
+  EXPECT_EQ(mono.dwChannelMask, SPEAKER_FRONT_CENTER);
+
+  const auto stereo = endpoint_format(WAVE_FORMAT_PCM, 2, 48000, 16);
+  EXPECT_EQ(stereo.SubFormat.Data1, WAVE_FORMAT_PCM);
+  EXPECT_EQ(stereo.dwChannelMask, static_cast<DWORD>(SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT));
+  EXPECT_EQ(endpoint_format(WAVE_FORMAT_PCM, 6, 48000, 16).dwChannelMask, 0u);
+
+  // Extensible data is copied unchanged
+  auto copied = platf::audio::tests::endpoint_waveformat(&stereo.Format, sizeof(stereo));
+  ASSERT_TRUE(copied.has_value());
+  EXPECT_EQ(std::memcmp(&*copied, &stereo, sizeof(stereo)), 0);
+
+  EXPECT_FALSE(platf::audio::tests::endpoint_waveformat(nullptr, sizeof(WAVEFORMATEX)).has_value());
+  EXPECT_FALSE(platf::audio::tests::endpoint_waveformat(&mono.Format, sizeof(WAVEFORMATEX) - 1).has_value());
+  EXPECT_FALSE(platf::audio::tests::endpoint_waveformat(&stereo.Format, sizeof(WAVEFORMATEX)).has_value());
+}
+
+TEST(WindowsAudioTest, ComparesEndpointSampleLayouts) {
+  const auto base = endpoint_format(WAVE_FORMAT_IEEE_FLOAT, 2, 48000, 32);
+  EXPECT_TRUE(platf::audio::tests::same_waveformat_layout(base, base));
+  EXPECT_FALSE(platf::audio::tests::same_waveformat_layout(base, endpoint_format(WAVE_FORMAT_IEEE_FLOAT, 1, 48000, 32)));
+  EXPECT_FALSE(platf::audio::tests::same_waveformat_layout(base, endpoint_format(WAVE_FORMAT_IEEE_FLOAT, 2, 44100, 32)));
+  EXPECT_FALSE(platf::audio::tests::same_waveformat_layout(base, endpoint_format(WAVE_FORMAT_PCM, 2, 48000, 24)));
+  EXPECT_FALSE(platf::audio::tests::same_waveformat_layout(base, endpoint_format(WAVE_FORMAT_PCM, 2, 48000, 32)));
+
+  auto padded = endpoint_format(WAVE_FORMAT_PCM, 2, 48000, 32);
+  padded.Samples.wValidBitsPerSample = 24;
+  EXPECT_FALSE(platf::audio::tests::same_waveformat_layout(endpoint_format(WAVE_FORMAT_PCM, 2, 48000, 32), padded));
+}
+
+TEST(WindowsAudioTest, MatchesSteamMicrophoneFormatsAtFortyEightKilohertzMono) {
+  // Steam Streaming Microphone's defaults: stereo 48 kHz playback, mono 44.1 kHz recording
+  const auto render = endpoint_format(WAVE_FORMAT_IEEE_FLOAT, 2, 48000, 32);
+  const auto capture = endpoint_format(WAVE_FORMAT_IEEE_FLOAT, 1, 44100, 32);
+  const auto pairs = platf::audio::tests::virtual_mic_format_pairs(render, capture);
+
+  const std::array<std::tuple<WORD, DWORD, WORD, DWORD>, 6> expected {
+    std::tuple {1, 48000, 1, 48000},
+    std::tuple {1, 44100, 1, 44100},
+    std::tuple {2, 48000, 2, 48000},
+    std::tuple {2, 44100, 2, 44100},
+    std::tuple {2, 48000, 1, 48000},
+    std::tuple {2, 44100, 1, 44100},
+  };
+  ASSERT_EQ(pairs.size(), expected.size());
+  for (std::size_t i = 0; i < pairs.size(); ++i) {
+    const auto &[render_format, capture_format] = pairs[i];
+    const auto &[render_channels, render_rate, capture_channels, capture_rate] = expected[i];
+    EXPECT_EQ(render_format.Format.nChannels, render_channels);
+    EXPECT_EQ(render_format.Format.nSamplesPerSec, render_rate);
+    EXPECT_EQ(capture_format.Format.nChannels, capture_channels);
+    EXPECT_EQ(capture_format.Format.nSamplesPerSec, capture_rate);
+    for (const auto &format : {render_format, capture_format}) {
+      EXPECT_EQ(format.Format.nBlockAlign, format.Format.nChannels * 4);
+      EXPECT_EQ(format.Format.nAvgBytesPerSec, format.Format.nSamplesPerSec * format.Format.nBlockAlign);
+      EXPECT_EQ(format.SubFormat.Data1, WAVE_FORMAT_IEEE_FLOAT);
+      EXPECT_EQ(format.dwChannelMask, format.Format.nChannels == 1 ? static_cast<DWORD>(SPEAKER_FRONT_CENTER) : static_cast<DWORD>(SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT));
+    }
+  }
+}
+
+TEST(WindowsAudioTest, MatchesVirtualMicrophoneSampleTypesFromEitherSide) {
+  const auto render = endpoint_format(WAVE_FORMAT_PCM, 2, 48000, 24);
+  const auto capture = endpoint_format(WAVE_FORMAT_PCM, 2, 44100, 16);
+  const auto pairs = platf::audio::tests::virtual_mic_format_pairs(render, capture);
+
+  ASSERT_FALSE(pairs.empty());
+  EXPECT_TRUE(platf::audio::tests::same_waveformat_layout(pairs.front().first, pairs.front().second));
+  EXPECT_EQ(pairs.front().first.Format.wBitsPerSample, 24);
+  EXPECT_EQ(pairs.front().first.Format.nSamplesPerSec, 48000u);
+
+  // The recording side's sample type is tried when the playback side's isn't accepted
+  EXPECT_TRUE(std::ranges::any_of(pairs, [](const auto &pair) {
+    return pair.first.Format.wBitsPerSample == 16 && platf::audio::tests::same_waveformat_layout(pair.first, pair.second);
+  }));
+
+  // Last resort: each side keeps its own sample type, and only the rate is matched
+  const auto &[render_format, capture_format] = pairs[pairs.size() - 2];
+  EXPECT_EQ(render_format.Format.wBitsPerSample, 24);
+  EXPECT_EQ(capture_format.Format.wBitsPerSample, 16);
+  EXPECT_EQ(render_format.Format.nSamplesPerSec, 48000u);
+  EXPECT_EQ(capture_format.Format.nSamplesPerSec, 48000u);
+}
+
+TEST(WindowsAudioTest, KeepsSurroundLayoutsOutOfMatchedMicrophoneFormats) {
+  auto render = endpoint_format(WAVE_FORMAT_IEEE_FLOAT, 8, 48000, 32);
+  render.dwChannelMask = 0x63f;
+  const auto capture = endpoint_format(WAVE_FORMAT_IEEE_FLOAT, 2, 48000, 32);
+  const auto pairs = platf::audio::tests::virtual_mic_format_pairs(render, capture);
+
+  ASSERT_FALSE(pairs.empty());
+  for (std::size_t i = 0; i + 1 < pairs.size(); ++i) {
+    EXPECT_LE(pairs[i].first.Format.nChannels, 2);
+  }
+
+  // Matching only the rate keeps the playback side's own layout
+  EXPECT_EQ(pairs.back().first.Format.nChannels, 8);
+  EXPECT_EQ(pairs.back().first.dwChannelMask, 0x63fu);
+  EXPECT_EQ(pairs.back().second.Format.nChannels, 2);
+}
+
+TEST(WindowsAudioTest, DescribesMonoFormats) {
+  EXPECT_EQ(platf::audio::tests::pretty_waveformat(endpoint_format(WAVE_FORMAT_IEEE_FLOAT, 1, 48000, 32)), "F32 48000 1.0");
 }
 #endif

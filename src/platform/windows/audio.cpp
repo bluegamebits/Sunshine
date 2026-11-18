@@ -5,7 +5,9 @@
 #define INITGUID
 
 // standard includes
+#include <algorithm>
 #include <array>
+#include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -214,6 +216,10 @@ namespace {
     result += std::format("{} {} ", static_cast<int>(waveformat.Samples.wValidBitsPerSample), static_cast<int>(waveformat.Format.nSamplesPerSec));
 
     switch (waveformat.dwChannelMask) {
+      case SPEAKER_FRONT_CENTER:
+        result += "1.0";
+        break;
+
       case waveformat_mask_stereo:
         result += "2.0";
         break;
@@ -236,6 +242,127 @@ namespace {
     }
 
     return result;
+  }
+
+  /**
+   * @brief Read an endpoint format, converting a plain format into its extensible form.
+   *
+   * @param format Endpoint format.
+   * @param size Size of the format data in bytes.
+   * @return Extensible format, or `std::nullopt` if the data is too short.
+   */
+  std::optional<WAVEFORMATEXTENSIBLE> to_waveformat_extensible(const WAVEFORMATEX *format, std::size_t size) {
+    if (!format || size < sizeof(WAVEFORMATEX)) {
+      return std::nullopt;
+    }
+
+    if (format->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+      if (size < sizeof(WAVEFORMATEXTENSIBLE)) {
+        return std::nullopt;
+      }
+
+      WAVEFORMATEXTENSIBLE extensible;
+      std::memcpy(&extensible, format, sizeof(extensible));
+      return extensible;
+    }
+
+    WAVEFORMATEXTENSIBLE extensible {};
+    extensible.Format = *format;
+    extensible.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+    extensible.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+    extensible.Samples.wValidBitsPerSample = format->wBitsPerSample;
+    extensible.SubFormat = format->wFormatTag == WAVE_FORMAT_IEEE_FLOAT ? KSDATAFORMAT_SUBTYPE_IEEE_FLOAT : KSDATAFORMAT_SUBTYPE_PCM;
+    extensible.dwChannelMask = format->nChannels == 1 ? SPEAKER_FRONT_CENTER :
+                               format->nChannels == 2 ? waveformat_mask_stereo :
+                                                        0;
+    return extensible;
+  }
+
+  /**
+   * @brief Copy a format with a different channel count and sample rate.
+   *
+   * @param base Format whose sample type and bit depth are kept.
+   * @param channels Channel count.
+   * @param sample_rate Sample rate in Hz.
+   * @return Adjusted format.
+   */
+  WAVEFORMATEXTENSIBLE with_channels_and_rate(const WAVEFORMATEXTENSIBLE &base, WORD channels, DWORD sample_rate) {
+    auto format = base;
+    format.Format.nChannels = channels;
+    format.Format.nSamplesPerSec = sample_rate;
+    format.Format.nBlockAlign = channels * format.Format.wBitsPerSample / 8;
+    format.Format.nAvgBytesPerSec = sample_rate * format.Format.nBlockAlign;
+    if (channels != base.Format.nChannels) {
+      format.dwChannelMask = channels == 1 ? SPEAKER_FRONT_CENTER : waveformat_mask_stereo;
+    }
+    return format;
+  }
+
+  /**
+   * @brief Check whether two endpoint formats carry samples identically.
+   *
+   * @param a First format.
+   * @param b Second format.
+   * @return `true` if channels, sample rate, bit depth and sample type are the same.
+   */
+  bool same_sample_layout(const WAVEFORMATEXTENSIBLE &a, const WAVEFORMATEXTENSIBLE &b) {
+    return a.Format.nChannels == b.Format.nChannels &&
+           a.Format.nSamplesPerSec == b.Format.nSamplesPerSec &&
+           a.Format.wBitsPerSample == b.Format.wBitsPerSample &&
+           a.Samples.wValidBitsPerSample == b.Samples.wValidBitsPerSample &&
+           a.SubFormat == b.SubFormat;
+  }
+
+  /**
+   * @brief Playback and recording formats to try on a virtual microphone cable.
+   */
+  struct remote_mic_format_pair_t {
+    WAVEFORMATEXTENSIBLE render;  ///< Format for the playback side.
+    WAVEFORMATEXTENSIBLE capture;  ///< Format for the recording side.
+  };
+
+  /**
+   * @brief List formats that make both sides of a virtual cable agree, best first.
+   * @details Virtual cables pass samples through without converting them, so the playback and
+   *          recording sides must use the same format. Identical formats are tried first, preferring
+   *          the recording side's channel count and Opus's 48 kHz. If no identical format is accepted,
+   *          each side keeps its own channel count and sample type, and only the sample rate is matched.
+   *
+   * @param render Current playback-side format.
+   * @param capture Current recording-side format.
+   * @return Format pairs to try in order.
+   */
+  std::vector<remote_mic_format_pair_t> remote_mic_format_pairs(const WAVEFORMATEXTENSIBLE &render, const WAVEFORMATEXTENSIBLE &capture) {
+    std::vector<remote_mic_format_pair_t> pairs;
+    auto add = [&pairs](const WAVEFORMATEXTENSIBLE &render_format, const WAVEFORMATEXTENSIBLE &capture_format) {
+      auto duplicate = std::ranges::any_of(pairs, [&](const auto &pair) {
+        return same_sample_layout(pair.render, render_format) && same_sample_layout(pair.capture, capture_format);
+      });
+      if (!duplicate) {
+        pairs.push_back({render_format, capture_format});
+      }
+    };
+
+    const std::array<DWORD, 3> rates = {48000, render.Format.nSamplesPerSec, capture.Format.nSamplesPerSec};
+    const std::array<WORD, 2> channel_counts = {
+      std::clamp<WORD>(capture.Format.nChannels, 1, 2),
+      std::clamp<WORD>(render.Format.nChannels, 1, 2),
+    };
+
+    for (const auto *base : {&render, &capture}) {
+      for (auto channels : channel_counts) {
+        for (auto rate : rates) {
+          auto format = with_channels_and_rate(*base, channels, rate);
+          add(format, format);
+        }
+      }
+    }
+
+    for (auto rate : rates) {
+      add(with_channels_and_rate(render, render.Format.nChannels, rate), with_channels_and_rate(capture, capture.Format.nChannels, rate));
+    }
+
+    return pairs;
   }
 
 }  // namespace
@@ -1537,6 +1664,85 @@ namespace platf::audio {
     }
 
     /**
+     * @brief Read the format Windows uses for an endpoint.
+     *
+     * @param device_id Endpoint device ID.
+     * @return Endpoint format, or `std::nullopt` if it can't be read.
+     */
+    std::optional<WAVEFORMATEXTENSIBLE> get_device_format(const std::wstring &device_id) {
+      device_t device;
+      if (FAILED(device_enum->GetDevice(device_id.c_str(), &device))) {
+        return std::nullopt;
+      }
+
+      audio::prop_t prop;
+      prop_var_t device_format;
+      if (FAILED(device->OpenPropertyStore(STGM_READ, &prop)) || FAILED(prop->GetValue(PKEY_AudioEngine_DeviceFormat, &device_format.prop)) || device_format.prop.vt != VT_BLOB) {
+        return std::nullopt;
+      }
+
+      return to_waveformat_extensible(reinterpret_cast<const WAVEFORMATEX *>(device_format.prop.blob.pBlobData), device_format.prop.blob.cbSize);
+    }
+
+    /**
+     * @brief Change the format Windows uses for an endpoint.
+     *
+     * @param device_id Endpoint device ID.
+     * @param format New endpoint format.
+     * @return `true` on success.
+     */
+    bool set_device_format(const std::wstring &device_id, const WAVEFORMATEXTENSIBLE &format) {
+      // IPolicyConfig is undocumented, so don't pass it pointers to anything we still use
+      auto device_id_copy = device_id;
+      auto format_copy = format;
+      WAVEFORMATEXTENSIBLE mix_format {};
+      return SUCCEEDED(policy->SetDeviceFormat(device_id_copy.c_str(), reinterpret_cast<WAVEFORMATEX *>(&format_copy), reinterpret_cast<WAVEFORMATEX *>(&mix_format)));
+    }
+
+    /**
+     * @brief Give both sides of the virtual microphone the same format.
+     * @details Virtual cables pass samples through without converting them. A different sample rate
+     *          or channel count on the recording side makes the microphone slow, low-pitched and distorted.
+     *          Must be called with `remote_mic_mutex` held, before any virtual microphone stream is open.
+     *
+     * @param endpoints Endpoints of the virtual microphone.
+     */
+    void match_remote_mic_formats(const remote_mic_endpoints_t &endpoints) {
+      if (!policy || endpoints.capture_id.empty()) {
+        return;
+      }
+
+      auto render = get_device_format(endpoints.render_id);
+      auto capture = get_device_format(endpoints.capture_id);
+      if (!render || !capture) {
+        BOOST_LOG(warning) << "Couldn't read the virtual microphone's formats"sv;
+        return;
+      }
+
+      if (same_sample_layout(*render, *capture)) {
+        return;
+      }
+
+      BOOST_LOG(info) << "Virtual microphone formats don't match: playback "sv << logging::bracket(waveformat_to_pretty_string(*render))
+                      << ", recording "sv << logging::bracket(waveformat_to_pretty_string(*capture));
+
+      for (const auto &[render_format, capture_format] : remote_mic_format_pairs(*render, *capture)) {
+        if (!set_device_format(endpoints.render_id, render_format)) {
+          continue;
+        }
+
+        if (set_device_format(endpoints.capture_id, capture_format)) {
+          BOOST_LOG(info) << "Virtual microphone now uses playback "sv << logging::bracket(waveformat_to_pretty_string(render_format))
+                          << ", recording "sv << logging::bracket(waveformat_to_pretty_string(capture_format));
+          return;
+        }
+      }
+
+      set_device_format(endpoints.render_id, *render);
+      BOOST_LOG(warning) << "Couldn't match the virtual microphone's formats. Set its playback and recording devices to the same sample rate in the Windows sound settings."sv;
+    }
+
+    /**
      * @brief Path of the file that records default recording devices to restore.
      *
      * @return Restore file path in Sunshine's application data directory.
@@ -1868,6 +2074,11 @@ namespace platf::audio {
       return nullptr;
     }
 
+    // Changing formats would break streams that are already open, so only do it for the first one
+    if (remote_mic_refs == 0) {
+      match_remote_mic_formats(*endpoints);
+    }
+
     if (mic->init(endpoints->render_id)) {
       return nullptr;
     }
@@ -2024,6 +2235,53 @@ namespace platf::audio {
 
       std::vector<float> sample(1);
       return mic.sample(sample);
+    }
+
+    /**
+     * @brief Convert endpoint format data with the production parser.
+     *
+     * @param format Endpoint format data.
+     * @param size Size of the data in bytes.
+     * @return Extensible format, or `std::nullopt` if the data is too short.
+     */
+    std::optional<WAVEFORMATEXTENSIBLE> endpoint_waveformat(const WAVEFORMATEX *format, std::size_t size) {
+      return to_waveformat_extensible(format, size);
+    }
+
+    /**
+     * @brief Check two formats with the production comparison.
+     *
+     * @param a First format.
+     * @param b Second format.
+     * @return `true` if both formats carry samples identically.
+     */
+    bool same_waveformat_layout(const WAVEFORMATEXTENSIBLE &a, const WAVEFORMATEXTENSIBLE &b) {
+      return same_sample_layout(a, b);
+    }
+
+    /**
+     * @brief List the virtual microphone formats the production code would try.
+     *
+     * @param render Current playback-side format.
+     * @param capture Current recording-side format.
+     * @return Playback and recording format pairs, best first.
+     */
+    std::vector<std::pair<WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE>> virtual_mic_format_pairs(const WAVEFORMATEXTENSIBLE &render, const WAVEFORMATEXTENSIBLE &capture) {
+      std::vector<std::pair<WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE>> result;
+      for (const auto &pair : remote_mic_format_pairs(render, capture)) {
+        result.emplace_back(pair.render, pair.capture);
+      }
+      return result;
+    }
+
+    /**
+     * @brief Describe a format with the production log formatter.
+     *
+     * @param waveformat Format to describe.
+     * @return Short description of the format.
+     */
+    std::string pretty_waveformat(const WAVEFORMATEXTENSIBLE &waveformat) {
+      return waveformat_to_pretty_string(waveformat);
     }
   }  // namespace tests
 #endif
