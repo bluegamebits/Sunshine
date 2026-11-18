@@ -973,6 +973,86 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
     </tr>
 </table>
 
+### mic_passthrough
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Accepts microphone audio from clients that support it (they must enable microphone streaming) and plays it
+            into a virtual microphone on the host, so games and voice chat apps can use the client's microphone.
+            <br>
+            <br>
+            On Windows, the virtual microphone is the "Steam Streaming Microphone" (installed automatically from Steam
+            when [install_steam_audio_drivers](#install_steam_audio_drivers) is enabled) or
+            [VB-Audio Virtual Cable](https://vb-audio.com/Cable/). On Linux, Sunshine creates a "Sunshine Microphone"
+            source with PulseAudio or PipeWire.
+            @note{This option is only supported on Windows and Linux.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            mic_passthrough = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### mic_device
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            The virtual microphone device that client microphone audio is played into. On Windows, this is the
+            playback side of a virtual cable (for example "CABLE Input"); the matching recording device is what
+            applications use. If unset, the device is chosen automatically.
+            @note{This option is only supported on Windows.}
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">Sunshine selects the Steam Streaming Microphone, then VB-Audio Virtual Cable.</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            mic_device = CABLE Input (VB-Audio Virtual Cable)
+            @endcode</td>
+    </tr>
+</table>
+
+### mic_set_default
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Makes the virtual microphone the default recording device while a client is streaming its microphone,
+            and restores the previous default afterwards. This lets applications use the client's microphone
+            without any configuration.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            mic_set_default = enabled
+            @endcode</td>
+    </tr>
+</table>
+
 ### adapter_name
 
 <table>

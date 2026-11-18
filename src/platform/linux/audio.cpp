@@ -6,6 +6,10 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
+#include <format>
+#include <functional>
+#include <mutex>
+#include <optional>
 #include <sstream>
 #include <thread>
 
@@ -171,6 +175,43 @@ namespace platf {
 
     return mic;
   }
+
+  /**
+   * @brief PulseAudio playback stream into Sunshine's virtual microphone sink.
+   */
+  struct remote_mic_pa_t: public remote_mic_t {
+    util::safe_ptr<pa_simple, &pa_simple_free> stream;  ///< Playback stream into the virtual microphone sink.
+    std::function<void()> release;  ///< Releases this user of the virtual microphone devices.
+
+    ~remote_mic_pa_t() override {
+      stream.reset();
+      if (release) {
+        release();
+      }
+    }
+
+    int write(const float *samples, int frame_count) override {
+      // Cap the latency so a backlog from network jitter doesn't build up
+      constexpr pa_usec_t max_latency_us = 150'000;
+
+      int status;
+      auto latency = pa_simple_get_latency(stream.get(), &status);
+      if (latency == (pa_usec_t) -1) {
+        BOOST_LOG(warning) << "Virtual microphone pa_simple_get_latency() failed: "sv << pa_strerror(status);
+        return -1;
+      }
+      if (latency > max_latency_us) {
+        return 0;
+      }
+
+      if (pa_simple_write(stream.get(), samples, frame_count * sizeof(float), &status) < 0) {
+        BOOST_LOG(warning) << "Virtual microphone pa_simple_write() failed: "sv << pa_strerror(status);
+        return -1;
+      }
+
+      return 0;
+    }
+  };
 
   namespace pa {
     template<bool B, class T>
@@ -691,6 +732,223 @@ namespace platf {
         requested_sink = sink;
 
         return 0;
+      }
+
+      static constexpr auto remote_mic_sink = "sink-sunshine-mic";  ///< Null sink that client microphone audio is played into.
+      static constexpr auto remote_mic_source = "sunshine-mic";  ///< Source remapped from the sink monitor for applications to record.
+
+      std::mutex remote_mic_mutex;  ///< Guards virtual microphone reference counting and default-source state.
+      int remote_mic_refs = 0;  ///< Number of open virtual microphones.
+      std::uint32_t remote_mic_sink_module = PA_INVALID_INDEX;  ///< Module index of the virtual microphone sink.
+      std::uint32_t remote_mic_source_module = PA_INVALID_INDEX;  ///< Module index of the virtual microphone source.
+      std::optional<std::string> saved_default_source;  ///< Default source replaced by the virtual microphone.
+
+      /**
+       * @brief Load a PulseAudio module.
+       *
+       * @param name Module name.
+       * @param args Module arguments.
+       * @return Module index, or PA_INVALID_INDEX on failure.
+       */
+      std::uint32_t load_module(const char *name, const std::string &args) {
+        auto alarm = safe::make_alarm<int>();
+
+        op_t op {pa_context_load_module(ctx.get(), name, args.c_str(), cb_i, alarm.get())};
+        if (!op) {
+          return PA_INVALID_INDEX;
+        }
+
+        alarm->wait();
+        return static_cast<std::uint32_t>(*alarm->status());
+      }
+
+      /**
+       * @brief Find the module that owns a sink or source.
+       *
+       * @param name Sink or source name.
+       * @param source `true` to look up a source, `false` for a sink.
+       * @return Owning module index, or PA_INVALID_INDEX if it doesn't exist.
+       */
+      std::uint32_t find_owner_module(const std::string &name, bool source) {
+        auto alarm = safe::make_alarm<int>();
+        std::uint32_t owner = PA_INVALID_INDEX;
+
+        // PulseAudio calls back once per match and then once more with a null pointer
+        // at the end of the list (or on error), so only ring the alarm at the end.
+        cb_t<pa_sink_info *> sink_f = [&](ctx_t::pointer, const pa_sink_info *info, int) {
+          if (info) {
+            owner = info->owner_module;
+            return;
+          }
+          alarm->ring(0);
+        };
+        cb_t<pa_source_info *> source_f = [&](ctx_t::pointer, const pa_source_info *info, int) {
+          if (info) {
+            owner = info->owner_module;
+            return;
+          }
+          alarm->ring(0);
+        };
+
+        op_t op {
+          source ?
+            pa_context_get_source_info_by_name(ctx.get(), name.c_str(), cb<pa_source_info *>, &source_f) :
+            pa_context_get_sink_info_by_name(ctx.get(), name.c_str(), cb<pa_sink_info *>, &sink_f)
+        };
+        if (!op) {
+          return PA_INVALID_INDEX;
+        }
+
+        alarm->wait();
+        return owner;
+      }
+
+      /**
+       * @brief Get default source name.
+       *
+       * @return PulseAudio name of the current default source, or an empty string.
+       */
+      std::string get_default_source_name() {
+        std::string source_name;
+        auto alarm = safe::make_alarm<int>();
+
+        cb_simple_t<pa_server_info *> server_f = [&](ctx_t::pointer, const pa_server_info *server_info) {
+          if (server_info && server_info->default_source_name) {
+            source_name = server_info->default_source_name;
+          }
+          alarm->ring(0);
+        };
+
+        op_t server_op {pa_context_get_server_info(ctx.get(), cb<pa_server_info *>, &server_f)};
+        if (server_op) {
+          alarm->wait();
+        }
+        return source_name;
+      }
+
+      /**
+       * @brief Set the default source.
+       *
+       * @param source Source name.
+       * @return 0 on success, nonzero on failure.
+       */
+      int set_default_source(const std::string &source) {
+        auto alarm = safe::make_alarm<int>();
+
+        op_t op {pa_context_set_default_source(ctx.get(), source.c_str(), success_cb, alarm.get())};
+        if (!op) {
+          return -1;
+        }
+
+        alarm->wait();
+        return *alarm->status();
+      }
+
+      /**
+       * @brief Create (or reuse) the virtual microphone sink and source.
+       * @details Must be called with `remote_mic_mutex` held.
+       *
+       * @return `true` if both devices exist.
+       */
+      bool create_remote_mic_devices() {
+        // Reuse devices left behind by a previous instance
+        remote_mic_sink_module = find_owner_module(remote_mic_sink, false);
+        if (remote_mic_sink_module == PA_INVALID_INDEX) {
+          remote_mic_sink_module = load_module(
+            "module-null-sink",
+            std::format("sink_name={} rate=48000 channels=1 format=float32le sink_properties=device.description=Sunshine-Microphone-Input", remote_mic_sink)
+          );
+          if (remote_mic_sink_module == PA_INVALID_INDEX) {
+            BOOST_LOG(error) << "Couldn't create virtual microphone sink: "sv << pa_strerror(pa_context_errno(ctx.get()));
+            return false;
+          }
+        }
+
+        // Expose the sink's monitor as a regular source, since many applications hide monitor sources
+        remote_mic_source_module = find_owner_module(remote_mic_source, true);
+        if (remote_mic_source_module == PA_INVALID_INDEX) {
+          remote_mic_source_module = load_module(
+            "module-remap-source",
+            std::format("source_name={} master={}.monitor source_properties=device.description=Sunshine-Microphone", remote_mic_source, remote_mic_sink)
+          );
+          if (remote_mic_source_module == PA_INVALID_INDEX) {
+            BOOST_LOG(error) << "Couldn't create virtual microphone source: "sv << pa_strerror(pa_context_errno(ctx.get()));
+            unload_null(remote_mic_sink_module);
+            remote_mic_sink_module = PA_INVALID_INDEX;
+            return false;
+          }
+        }
+
+        return true;
+      }
+
+      /**
+       * @brief Remove the virtual microphone devices and restore the default source.
+       * @details Must be called with `remote_mic_mutex` held.
+       */
+      void destroy_remote_mic_devices() {
+        if (saved_default_source) {
+          if (!saved_default_source->empty() && *saved_default_source != remote_mic_source) {
+            set_default_source(*saved_default_source);
+          }
+          saved_default_source.reset();
+        }
+
+        unload_null(remote_mic_source_module);
+        unload_null(remote_mic_sink_module);
+        remote_mic_source_module = PA_INVALID_INDEX;
+        remote_mic_sink_module = PA_INVALID_INDEX;
+      }
+
+      std::unique_ptr<remote_mic_t> remote_mic() override {
+        std::lock_guard lg {remote_mic_mutex};
+
+        if (remote_mic_refs == 0) {
+          if (!create_remote_mic_devices()) {
+            return nullptr;
+          }
+
+          if (config::audio.mic_set_default) {
+            saved_default_source = get_default_source_name();
+            if (set_default_source(remote_mic_source)) {
+              BOOST_LOG(warning) << "Couldn't make the virtual microphone the default source"sv;
+            }
+          }
+        }
+
+        auto mic = std::make_unique<remote_mic_pa_t>();
+
+        pa_sample_spec ss {PA_SAMPLE_FLOAT32, 48000, 1};
+        pa_buffer_attr pa_attr = {
+          .maxlength = uint32_t(-1),
+          .tlength = (uint32_t) pa_usec_to_bytes(60'000, &ss),
+          .prebuf = uint32_t(-1),
+          .minreq = uint32_t(-1),
+          .fragsize = uint32_t(-1)
+        };
+
+        int status;
+        mic->stream.reset(
+          pa_simple_new(nullptr, "sunshine", PA_STREAM_PLAYBACK, remote_mic_sink, "sunshine-microphone", &ss, nullptr, &pa_attr, &status)
+        );
+        if (!mic->stream) {
+          BOOST_LOG(error) << "Couldn't open virtual microphone stream: "sv << pa_strerror(status);
+          if (remote_mic_refs == 0) {
+            destroy_remote_mic_devices();
+          }
+          return nullptr;
+        }
+
+        ++remote_mic_refs;
+        mic->release = [this]() {
+          std::lock_guard lg {remote_mic_mutex};
+          if (--remote_mic_refs == 0) {
+            destroy_remote_mic_devices();
+          }
+        };
+
+        BOOST_LOG(info) << "Playing client microphone into ["sv << remote_mic_source << ']';
+        return mic;
       }
 
       ~server_t() override {

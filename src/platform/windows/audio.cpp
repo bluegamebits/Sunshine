@@ -6,8 +6,11 @@
 
 // standard includes
 #include <array>
+#include <filesystem>
 #include <format>
+#include <fstream>
 #include <functional>
+#include <mutex>
 #include <type_traits>
 #include <utility>
 
@@ -58,7 +61,24 @@ namespace {
   constexpr auto SAMPLE_RATE = 48000;
 #ifdef STEAM_DRIVER_SUBDIR
   constexpr auto STEAM_AUDIO_DRIVER_PATH = L"%CommonProgramFiles(x86)%\\Steam\\drivers\\Windows10\\" STEAM_DRIVER_SUBDIR L"\\SteamStreamingSpeakers.inf";
+  constexpr auto STEAM_MIC_DRIVER_PATH = L"%CommonProgramFiles(x86)%\\Steam\\drivers\\Windows10\\" STEAM_DRIVER_SUBDIR L"\\SteamStreamingMicrophone.inf";
 #endif
+
+  /**
+   * @brief Virtual audio cables that can act as a microphone, in order of preference.
+   * @details Each adapter exposes a playback endpoint that Sunshine plays client audio into
+   *          and a recording endpoint that host applications use as a microphone.
+   */
+  constexpr std::array<const wchar_t *, 2> REMOTE_MIC_ADAPTERS = {
+    L"Steam Streaming Microphone",
+    L"VB-Audio Virtual Cable",
+  };
+
+  /**
+   * @brief File recording the default recording devices replaced by the virtual microphone.
+   * @details It lets Sunshine restore them on the next start if it exits while a client microphone is active.
+   */
+  constexpr auto REMOTE_MIC_RESTORE_FILE = "mic_default_capture_restore.txt";
 
   constexpr auto waveformat_mask_stereo = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
 
@@ -263,6 +283,10 @@ namespace platf::audio {
    * @brief COM pointer to the WASAPI capture client interface.
    */
   using audio_capture_t = util::safe_ptr<IAudioCaptureClient, &Release<IAudioCaptureClient>>;
+  /**
+   * @brief COM pointer to the WASAPI render client interface.
+   */
+  using audio_render_t = util::safe_ptr<IAudioRenderClient, &Release<IAudioRenderClient>>;
   /**
    * @brief CoTaskMem-allocated WAVEFORMATEX pointer.
    */
@@ -1199,15 +1223,16 @@ namespace platf::audio {
     /**
      * @brief Search for currently present audio device_id using multiple match fields.
      * @param match_list Pairs of match fields and values
+     * @param flow Whether to search playback (eRender) or recording (eCapture) endpoints.
      * @return Optional pair of matched field and device_id
      */
-    std::optional<matched_field_t> find_device_id(const match_fields_list_t &match_list) {
+    std::optional<matched_field_t> find_device_id(const match_fields_list_t &match_list, EDataFlow flow = eRender) {
       if (match_list.empty()) {
         return std::nullopt;
       }
 
       collection_t collection;
-      auto status = device_enum->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &collection);
+      auto status = device_enum->EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE, &collection);
       if (FAILED(status)) {
         BOOST_LOG(error) << "Couldn't enumerate: [0x"sv << util::hex(status).to_string_view() << ']';
         return std::nullopt;
@@ -1342,6 +1367,35 @@ namespace platf::audio {
      */
     bool install_steam_audio_drivers() {
 #ifdef STEAM_DRIVER_SUBDIR
+      return install_steam_driver(STEAM_AUDIO_DRIVER_PATH, "Steam Streaming Speakers"sv);
+#else
+      BOOST_LOG(warning) << "Unable to install Steam Streaming Speakers on unknown architecture"sv;
+      return false;
+#endif
+    }
+
+    /**
+     * @brief Installs the Steam Streaming Microphone driver, if present.
+     * @return `true` if installation was successful.
+     */
+    bool install_steam_microphone_driver() {
+#ifdef STEAM_DRIVER_SUBDIR
+      return install_steam_driver(STEAM_MIC_DRIVER_PATH, "Steam Streaming Microphone"sv);
+#else
+      BOOST_LOG(warning) << "Unable to install Steam Streaming Microphone on unknown architecture"sv;
+      return false;
+#endif
+    }
+
+    /**
+     * @brief Installs one of Steam's virtual audio drivers while preserving the default playback device.
+     *
+     * @param driver_path_template INF path, which may contain environment variables.
+     * @param name Driver name used in log messages.
+     * @return `true` if installation was successful.
+     */
+    bool install_steam_driver(const wchar_t *driver_path_template, std::string_view name) {
+#ifdef STEAM_DRIVER_SUBDIR
       // MinGW's libnewdev.a is missing DiInstallDriverW() even though the headers have it,
       // so we have to load it at runtime. It's Vista or later, so it will always be available.
       auto newdev = LoadLibraryExW(L"newdev.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -1362,11 +1416,11 @@ namespace platf::audio {
       // Get the current default audio device (if present)
       auto old_default_dev = default_device(device_enum);
 
-      // Install the Steam Streaming Speakers driver
+      // Install the Steam driver
       std::array<WCHAR, MAX_PATH> driver_path = {};
-      ExpandEnvironmentStringsW(STEAM_AUDIO_DRIVER_PATH, driver_path.data(), driver_path.size());
+      ExpandEnvironmentStringsW(driver_path_template, driver_path.data(), driver_path.size());
       if (fn_DiInstallDriverW(nullptr, driver_path.data(), 0, nullptr)) {
-        BOOST_LOG(info) << "Successfully installed Steam Streaming Speakers"sv;
+        BOOST_LOG(info) << "Successfully installed "sv << name;
 
         // Wait for 5 seconds to allow the audio subsystem to reconfigure things before
         // modifying the default audio device or enumerating devices again.
@@ -1388,7 +1442,7 @@ namespace platf::audio {
         auto err = GetLastError();
         switch (err) {
           case ERROR_ACCESS_DENIED:
-            BOOST_LOG(warning) << "Administrator privileges are required to install Steam Streaming Speakers"sv;
+            BOOST_LOG(warning) << "Administrator privileges are required to install "sv << name;
             break;
           case ERROR_FILE_NOT_FOUND:
           case ERROR_PATH_NOT_FOUND:
@@ -1402,9 +1456,196 @@ namespace platf::audio {
         return false;
       }
 #else
-      BOOST_LOG(warning) << "Unable to install Steam Streaming Speakers on unknown architecture"sv;
+      BOOST_LOG(warning) << "Unable to install "sv << name << " on unknown architecture"sv;
       return false;
 #endif
+    }
+
+    /**
+     * @brief Playback and recording endpoints of the virtual microphone.
+     */
+    struct remote_mic_endpoints_t {
+      std::wstring render_id;  ///< Playback endpoint that client audio is played into.
+      std::wstring capture_id;  ///< Recording endpoint that host applications use, if found.
+      std::wstring adapter;  ///< Adapter (virtual cable) name.
+    };
+
+    /**
+     * @brief Read the adapter friendly name of an endpoint.
+     *
+     * @param device_id Endpoint device ID.
+     * @return Adapter friendly name, or an empty string if unavailable.
+     */
+    std::wstring get_adapter_name(const std::wstring &device_id) {
+      device_t device;
+      if (FAILED(device_enum->GetDevice(device_id.c_str(), &device))) {
+        return {};
+      }
+
+      audio::prop_t prop;
+      if (FAILED(device->OpenPropertyStore(STGM_READ, &prop))) {
+        return {};
+      }
+
+      prop_var_t adapter_friendly_name;
+      if (FAILED(prop->GetValue(PKEY_DeviceInterface_FriendlyName, &adapter_friendly_name.prop)) || !adapter_friendly_name.prop.pwszVal) {
+        return {};
+      }
+
+      return adapter_friendly_name.prop.pwszVal;
+    }
+
+    /**
+     * @brief Find the configured or automatically selected virtual microphone.
+     *
+     * @return Endpoints of the virtual microphone, or `std::nullopt` if none is present.
+     */
+    std::optional<remote_mic_endpoints_t> find_remote_mic_endpoints() {
+      remote_mic_endpoints_t endpoints;
+
+      if (!config::audio.mic_device.empty()) {
+        auto matched = find_device_id(match_all_fields(utf_utils::from_utf8(config::audio.mic_device)), eRender);
+        if (!matched) {
+          BOOST_LOG(warning) << "Couldn't find the configured virtual microphone device: "sv << config::audio.mic_device;
+          return std::nullopt;
+        }
+
+        endpoints.render_id = matched->second;
+        endpoints.adapter = get_adapter_name(endpoints.render_id);
+      } else {
+        for (auto adapter : REMOTE_MIC_ADAPTERS) {
+          if (auto matched = find_device_id({{match_field_e::adapter_friendly_name, adapter}}, eRender)) {
+            endpoints.render_id = matched->second;
+            endpoints.adapter = adapter;
+            break;
+          }
+        }
+
+        if (endpoints.render_id.empty()) {
+          return std::nullopt;
+        }
+      }
+
+      // The recording side of a virtual cable shares the adapter with the playback side
+      if (!endpoints.adapter.empty()) {
+        if (auto matched = find_device_id({{match_field_e::adapter_friendly_name, endpoints.adapter}}, eCapture)) {
+          endpoints.capture_id = matched->second;
+        }
+      }
+
+      return endpoints;
+    }
+
+    /**
+     * @brief Path of the file that records default recording devices to restore.
+     *
+     * @return Restore file path in Sunshine's application data directory.
+     */
+    static std::filesystem::path remote_mic_restore_file() {
+      return platf::appdata() / REMOTE_MIC_RESTORE_FILE;
+    }
+
+    /**
+     * @brief Make the virtual microphone the default recording device for all roles.
+     * @details The previous defaults are saved in memory and on disk so they can be restored.
+     *          Must be called with `remote_mic_mutex` held.
+     *
+     * @param capture_id Recording endpoint of the virtual microphone.
+     */
+    void set_remote_mic_default(const std::wstring &capture_id) {
+      if (!config::audio.mic_set_default || !policy || capture_id.empty()) {
+        return;
+      }
+
+      std::ofstream restore_file {remote_mic_restore_file(), std::ios::trunc};
+      for (int x = 0; x < (int) ERole_enum_count; ++x) {
+        auto &saved = saved_default_capture[x];
+        saved.clear();
+
+        device_t device;
+        if (SUCCEEDED(device_enum->GetDefaultAudioEndpoint(eCapture, (ERole) x, &device))) {
+          audio::wstring_t id;
+          if (SUCCEEDED(device->GetId(&id))) {
+            saved = id.get();
+          }
+        }
+
+        // An empty line means there was no default device for this role
+        restore_file << (saved == capture_id ? std::string {} : utf_utils::to_utf8(saved)) << '\n';
+
+        if (auto status = policy->SetDefaultEndpoint(capture_id.c_str(), (ERole) x); FAILED(status)) {
+          BOOST_LOG(warning) << "Couldn't make the virtual microphone the default for role ["sv << x << "]: 0x"sv << util::hex(status).to_string_view();
+        }
+      }
+
+      changed_default_capture = true;
+      BOOST_LOG(info) << "Virtual microphone is now the default recording device"sv;
+    }
+
+    /**
+     * @brief Restore default recording devices recorded in a file by a previous Sunshine instance.
+     * @details This handles Sunshine exiting while the virtual microphone was the default.
+     */
+    void restore_remote_mic_default_from_file() {
+      std::error_code ec;
+      auto path = remote_mic_restore_file();
+      if (!std::filesystem::exists(path, ec) || !policy) {
+        return;
+      }
+
+      std::ifstream restore_file {path};
+      std::string line;
+      for (int x = 0; x < (int) ERole_enum_count && std::getline(restore_file, line); ++x) {
+        if (!line.empty()) {
+          policy->SetDefaultEndpoint(utf_utils::from_utf8(line).c_str(), (ERole) x);
+        }
+      }
+      restore_file.close();
+
+      std::filesystem::remove(path, ec);
+      BOOST_LOG(info) << "Restored default recording device after unclean shutdown"sv;
+    }
+
+    /**
+     * @brief Restore the default recording devices replaced by set_remote_mic_default().
+     * @details Must be called with `remote_mic_mutex` held.
+     */
+    void restore_remote_mic_default() {
+      if (!changed_default_capture) {
+        return;
+      }
+      changed_default_capture = false;
+
+      for (int x = 0; x < (int) ERole_enum_count; ++x) {
+        const auto &saved = saved_default_capture[x];
+        if (saved.empty()) {
+          continue;
+        }
+
+        // Skip devices that disappeared while streaming
+        device_t device;
+        if (DWORD state {}; FAILED(device_enum->GetDevice(saved.c_str(), &device)) || FAILED(device->GetState(&state)) || state != DEVICE_STATE_ACTIVE) {
+          continue;
+        }
+
+        policy->SetDefaultEndpoint(saved.c_str(), (ERole) x);
+      }
+
+      std::error_code ec;
+      std::filesystem::remove(remote_mic_restore_file(), ec);
+      BOOST_LOG(info) << "Restored the default recording device"sv;
+    }
+
+    std::unique_ptr<::platf::remote_mic_t> remote_mic() override;
+
+    /**
+     * @brief Release one virtual microphone user, restoring the default recording device after the last one.
+     */
+    void release_remote_mic() {
+      std::lock_guard lg {remote_mic_mutex};
+      if (--remote_mic_refs == 0) {
+        restore_remote_mic_default();
+      }
     }
 
     /**
@@ -1456,7 +1697,193 @@ namespace platf::audio {
     policy_t policy;  ///< Windows policy configuration interface used to switch default audio devices.
     audio::device_enum_t device_enum;  ///< Device enumerator used to query and watch audio endpoints.
     std::string assigned_sink;  ///< Sink assigned while Sunshine captures host audio, captured directly by the microphone.
+
+    std::mutex remote_mic_mutex;  ///< Guards virtual microphone reference counting and default-device state.
+    int remote_mic_refs = 0;  ///< Number of open virtual microphones.
+    bool changed_default_capture = false;  ///< Whether the virtual microphone replaced the default recording device.
+    std::array<std::wstring, ERole_enum_count> saved_default_capture;  ///< Default recording devices to restore, by role.
   };
+
+  /**
+   * @brief WASAPI stream that plays client microphone audio into a virtual cable.
+   */
+  class remote_mic_wasapi_t: public ::platf::remote_mic_t {
+  public:
+    explicit remote_mic_wasapi_t(audio_control_t *control):
+        control {control} {
+    }
+
+    ~remote_mic_wasapi_t() override {
+      if (audio_client && started) {
+        audio_client->Stop();
+      }
+      if (registered) {
+        control->release_remote_mic();
+      }
+    }
+
+    /**
+     * @brief Open a shared-mode playback stream on the virtual cable's playback endpoint.
+     *
+     * @param render_id Playback endpoint ID.
+     * @return 0 on success, -1 on failure.
+     */
+    int init(const std::wstring &render_id) {
+      device_t device;
+      if (auto status = control->device_enum->GetDevice(render_id.c_str(), &device); FAILED(status)) {
+        BOOST_LOG(error) << "Couldn't open virtual microphone device: [0x"sv << util::hex(status).to_string_view() << ']';
+        return -1;
+      }
+
+      if (auto status = device->Activate(IID_IAudioClient, CLSCTX_ALL, nullptr, (void **) &audio_client); FAILED(status)) {
+        BOOST_LOG(error) << "Couldn't activate virtual microphone device: [0x"sv << util::hex(status).to_string_view() << ']';
+        return -1;
+      }
+
+      WAVEFORMATEX waveformat {};
+      waveformat.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+      waveformat.nChannels = 1;
+      waveformat.nSamplesPerSec = SAMPLE_RATE;
+      waveformat.wBitsPerSample = 32;
+      waveformat.nBlockAlign = sizeof(float);
+      waveformat.nAvgBytesPerSec = SAMPLE_RATE * sizeof(float);
+
+      // Let Windows convert our mono 48 kHz float audio into the device's mix format
+      constexpr REFERENCE_TIME buffer_duration = 2'000'000;  // 200 ms in 100 ns units
+      auto status = audio_client->Initialize(
+        AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+        buffer_duration,
+        0,
+        &waveformat,
+        nullptr
+      );
+      if (FAILED(status)) {
+        BOOST_LOG(error) << "Couldn't initialize virtual microphone stream: [0x"sv << util::hex(status).to_string_view() << ']';
+        return -1;
+      }
+
+      if (FAILED(audio_client->GetBufferSize(&buffer_frames))) {
+        return -1;
+      }
+
+      if (auto status = audio_client->GetService(IID_IAudioRenderClient, (void **) &render_client); FAILED(status)) {
+        BOOST_LOG(error) << "Couldn't get virtual microphone render client: [0x"sv << util::hex(status).to_string_view() << ']';
+        return -1;
+      }
+
+      return 0;
+    }
+
+    int write(const float *samples, int frame_count) override {
+      // Keep enough audio queued to ride out network jitter, but cap the latency
+      constexpr UINT32 jitter_frames = SAMPLE_RATE * 40 / 1000;  // 40 ms
+      constexpr UINT32 max_queued_frames = SAMPLE_RATE * 150 / 1000;  // 150 ms
+
+      UINT32 padding;
+      if (auto status = audio_client->GetCurrentPadding(&padding); FAILED(status)) {
+        BOOST_LOG(warning) << "Virtual microphone GetCurrentPadding() failed: [0x"sv << util::hex(status).to_string_view() << ']';
+        return -1;
+      }
+
+      // Prime (or re-prime after running dry) with silence to absorb jitter
+      if (padding == 0) {
+        if (write_frames(nullptr, jitter_frames) < 0) {
+          return -1;
+        }
+        padding = jitter_frames;
+      }
+
+      if (padding + frame_count > max_queued_frames) {
+        // We're too far behind real time, so drop this packet to catch up
+        return 0;
+      }
+
+      if (write_frames(samples, std::min<UINT32>(frame_count, buffer_frames - padding)) < 0) {
+        return -1;
+      }
+
+      if (!started) {
+        if (auto status = audio_client->Start(); FAILED(status)) {
+          BOOST_LOG(error) << "Couldn't start virtual microphone stream: [0x"sv << util::hex(status).to_string_view() << ']';
+          return -1;
+        }
+        started = true;
+      }
+
+      return 0;
+    }
+
+    co_init_t co_init;  ///< COM initialization for the thread that uses this stream; must outlive the COM pointers below.
+    audio_control_t *control;  ///< Controller that owns default-device state.
+    bool registered = false;  ///< Whether this stream counts towards the controller's reference count.
+    bool started = false;  ///< Whether the WASAPI stream was started.
+    audio_client_t audio_client;  ///< Shared-mode WASAPI client.
+    audio_render_t render_client;  ///< Render client used to queue samples.
+    UINT32 buffer_frames = 0;  ///< WASAPI buffer size in frames.
+
+  private:
+    /**
+     * @brief Copy samples, or silence when `samples` is null, into the WASAPI buffer.
+     *
+     * @param samples Samples to queue, or nullptr for silence.
+     * @param frame_count Number of frames.
+     * @return 0 on success, -1 on failure.
+     */
+    int write_frames(const float *samples, UINT32 frame_count) {
+      if (frame_count == 0) {
+        return 0;
+      }
+
+      BYTE *buffer;
+      if (auto status = render_client->GetBuffer(frame_count, &buffer); FAILED(status)) {
+        BOOST_LOG(warning) << "Virtual microphone GetBuffer() failed: [0x"sv << util::hex(status).to_string_view() << ']';
+        return -1;
+      }
+
+      if (samples) {
+        std::memcpy(buffer, samples, frame_count * sizeof(float));
+      }
+
+      render_client->ReleaseBuffer(frame_count, samples ? 0 : AUDCLNT_BUFFERFLAGS_SILENT);
+      return 0;
+    }
+  };
+
+  std::unique_ptr<::platf::remote_mic_t> audio_control_t::remote_mic() {
+    // Construct first so COM is initialized on this thread before we use any interfaces
+    auto mic = std::make_unique<remote_mic_wasapi_t>(this);
+
+    std::lock_guard lg {remote_mic_mutex};
+
+    auto endpoints = find_remote_mic_endpoints();
+    if (!endpoints && config::audio.mic_device.empty() && !config::audio.external_audio && config::audio.install_steam_drivers) {
+      // Try to install Steam's virtual microphone on first use
+      if (install_steam_microphone_driver()) {
+        endpoints = find_remote_mic_endpoints();
+      }
+    }
+
+    if (!endpoints) {
+      return nullptr;
+    }
+
+    if (mic->init(endpoints->render_id)) {
+      return nullptr;
+    }
+
+    BOOST_LOG(info) << "Playing client microphone into ["sv << utf_utils::to_utf8(endpoints->adapter) << ']';
+    if (endpoints->capture_id.empty()) {
+      BOOST_LOG(warning) << "Couldn't find the recording side of the virtual microphone"sv;
+    }
+
+    if (remote_mic_refs++ == 0) {
+      set_remote_mic_default(endpoints->capture_id);
+    }
+    mic->registered = true;
+
+    return mic;
+  }
 
 #ifdef SUNSHINE_TESTS
   namespace tests {
@@ -1644,6 +2071,9 @@ namespace platf {
     audio::audio_control_t audio_ctrl;
     if (audio_ctrl.init() == 0) {
       audio_ctrl.reset_default_device();
+
+      // Restore the default microphone if we exited while a client microphone was active
+      audio_ctrl.restore_remote_mic_default_from_file();
     }
 
     return co_init;

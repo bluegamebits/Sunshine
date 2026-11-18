@@ -242,6 +242,9 @@ namespace config {
     bool stream;  ///< Enable audio streaming to clients
     bool install_steam_drivers;  ///< Install Steam audio drivers for enhanced compatibility
     bool external_audio;  ///< Windows capture-only mode; an external router owns endpoint defaults and formats.
+    bool mic_passthrough;  ///< Accept microphone audio from clients and play it into a virtual microphone
+    std::string mic_device;  ///< Virtual microphone device to use; chosen automatically when empty
+    bool mic_set_default;  ///< Make the virtual microphone the default recording device while clients stream to it
   };
 
   /**

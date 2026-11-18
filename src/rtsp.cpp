@@ -876,7 +876,12 @@ namespace rtsp_stream {
     std::stringstream ss;
 
     // Tell the client about our supported features
-    ss << "a=x-ss-general.featureFlags:" << (uint32_t) platf::get_capabilities() << std::endl;
+    auto feature_flags = (uint32_t) platf::get_capabilities();
+    if (platf::remote_mic_supported && config::audio.mic_passthrough) {
+      // We can play client microphone audio into a virtual microphone
+      feature_flags |= LI_FF_MICROPHONE_V1;
+    }
+    ss << "a=x-ss-general.featureFlags:" << feature_flags << std::endl;
 
     // Always request new control stream encryption if the client supports it
     uint32_t encryption_flags_supported = SS_ENC_CONTROL_V2 | SS_ENC_AUDIO;

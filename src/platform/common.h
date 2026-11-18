@@ -880,6 +880,30 @@ namespace platf {
     virtual ~mic_t() = default;
   };
 
+#if defined(_WIN32) || defined(__linux__) || defined(__FreeBSD__)
+  constexpr bool remote_mic_supported = true;  ///< Whether this platform can play client microphone audio into a virtual microphone.
+#else
+  constexpr bool remote_mic_supported = false;  ///< Whether this platform can play client microphone audio into a virtual microphone.
+#endif
+
+  /**
+   * @brief Virtual microphone that plays client microphone audio for host applications to record.
+   * @details Destroying the last instance restores the host's default recording device.
+   */
+  class remote_mic_t {
+  public:
+    /**
+     * @brief Queue mono 48 kHz PCM samples for playback into the virtual microphone.
+     *
+     * @param samples Floating-point PCM samples.
+     * @param frame_count Number of samples.
+     * @return 0 on success, or a negative value if the device failed and should be recreated.
+     */
+    virtual int write(const float *samples, int frame_count) = 0;
+
+    virtual ~remote_mic_t() = default;
+  };
+
   /**
    * @brief Platform audio controller that manages sinks and microphone capture.
    */
@@ -919,6 +943,17 @@ namespace platf {
      * @return Host and virtual sink names when the backend can report them.
      */
     virtual std::optional<sink_t> sink_info() = 0;
+
+    /**
+     * @brief Open the virtual microphone that client microphone audio is played into.
+     * @details The first open instance may make the virtual microphone the default recording device.
+     *          The returned object must be destroyed before this audio control.
+     *
+     * @return Virtual microphone, or nullptr if the platform or system has none available.
+     */
+    virtual std::unique_ptr<remote_mic_t> remote_mic() {
+      return nullptr;
+    }
 
     /**
      * @brief Destroy the audio control.

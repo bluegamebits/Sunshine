@@ -15,6 +15,7 @@
 // lib includes
 #include <boost/endian/arithmetic.hpp>
 #include <openssl/err.h>
+#include <opus/opus.h>
 #include <rs.h>
 
 // Keep this separate so clang-format preserves the include order.
@@ -358,6 +359,10 @@ namespace stream {
    * @brief Shared queue set used to distribute packet queues to broadcast workers.
    */
   using message_queue_queue_t = std::shared_ptr<safe::queue_t<std::tuple<socket_e, av_session_id_t, message_queue_t>>>;
+  /**
+   * @brief Queue of raw microphone packets received for one stream session.
+   */
+  using mic_queue_t = std::shared_ptr<safe::queue_t<std::string>>;
 
   // return bytes written on success
   // return -1 on error
@@ -492,6 +497,8 @@ namespace stream {
     udp::socket audio_sock {io_context};  ///< UDP socket bound for audio packet transmission.
 
     control_server_t control_server;  ///< ENet server for GameStream control packets.
+
+    sync_util::sync_t<std::map<std::string, mic_queue_t, std::less<>>> mic_queues;  ///< Microphone packet queues keyed by session ID (audio ping payload).
   };
 
   /**
@@ -506,6 +513,7 @@ namespace stream {
 
     std::jthread audioThread;  ///< Audio thread.
     std::jthread videoThread;  ///< Video thread.
+    std::jthread micThread;  ///< Microphone passthrough thread, only started when negotiated.
 
     std::chrono::steady_clock::time_point pingTimeout;  ///< Deadline for receiving the next client ping.
 
@@ -543,6 +551,10 @@ namespace stream {
       audio_fec_packet_t fec_packet;  ///< Reusable packet header for audio forward-error-correction shards.
       std::unique_ptr<platf::deinit_t> qos;  ///< Lifetime guard for audio-socket QoS configuration.
     } audio;  ///< Audio capture configuration for the stream..
+
+    struct {
+      crypto::aes_t key;  ///< AES-GCM key used to authenticate and decrypt microphone packets.
+    } mic;  ///< Microphone passthrough state.
 
     struct {
       crypto::cipher::gcm_t cipher;  ///< AES-GCM cipher for the encrypted control channel.
@@ -1514,6 +1526,21 @@ namespace stream {
           return;
         }
 
+        // Microphone packets arrive on the audio socket. They start with a 0xFF byte,
+        // which can't be confused with a ping since ping payloads are printable.
+        if (buf_elem == 1 && bytes > sizeof(SS_MIC_PACKET_HEADER)) {
+          auto mic_header = (const SS_MIC_PACKET_HEADER *) buf[buf_elem].data();
+          if (util::endian::big<std::uint32_t>(mic_header->magic) == SS_MIC_PACKET_MAGIC) {
+            std::string_view session_id {mic_header->sessionId, sizeof(mic_header->sessionId)};
+
+            auto lg = ctx.mic_queues.lock();
+            if (auto it = ctx.mic_queues->find(session_id); it != std::end(*ctx.mic_queues)) {
+              it->second->raise(std::string {buf[buf_elem].data(), bytes});
+            }
+            return;
+          }
+        }
+
         if (bytes == 4) {
           // For legacy PING packets, find the matching session by address.
           auto it = peer_to_session.find(peer.address());
@@ -2257,6 +2284,186 @@ namespace stream {
     audio::capture(session->mail, session->config.audio, session);
   }
 
+  namespace mic {
+    constexpr auto MAX_FRAME_SAMPLES = SS_MIC_SAMPLE_RATE / 1000 * 120;  ///< Longest Opus frame (120 ms).
+    constexpr std::uint32_t MAX_CONCEALED_PACKETS = 5;  ///< Longer gaps are treated as a discontinuity rather than concealed.
+
+    /**
+     * @brief Decrypt and validate one microphone packet.
+     *
+     * @param packet Raw packet received on the audio socket.
+     * @param cipher AES-GCM cipher keyed with the session's remote input key.
+     * @param plaintext Receives the decrypted Opus packet.
+     * @param seq Receives the packet sequence number.
+     * @return `true` if the packet is authentic and well formed.
+     */
+    bool decrypt_packet(const std::string &packet, crypto::cipher::gcm_t &cipher, std::vector<std::uint8_t> &plaintext, std::uint32_t &seq) {
+      if (packet.size() <= sizeof(SS_MIC_PACKET_HEADER) || packet.size() > sizeof(SS_MIC_PACKET_HEADER) + SS_MIC_MAX_OPUS_PAYLOAD) {
+        return false;
+      }
+
+      SS_MIC_PACKET_HEADER header;
+      std::memcpy(&header, packet.data(), sizeof(header));
+      if (header.version != SS_MIC_PACKET_VERSION) {
+        return false;
+      }
+
+      // IV: big-endian sequence number, then zeros, then 'C' (client originated) and 'M' (microphone)
+      crypto::aes_t iv(12);
+      std::memcpy(iv.data(), &header.sequenceNumber, sizeof(header.sequenceNumber));
+      iv[10] = 'C';
+      iv[11] = 'M';
+
+      // The tag immediately precedes the ciphertext, which is the layout decrypt() expects
+      constexpr auto tag_offset = offsetof(SS_MIC_PACKET_HEADER, tag);
+      std::string_view tagged_cipher {packet.data() + tag_offset, packet.size() - tag_offset};
+      if (cipher.decrypt(tagged_cipher, plaintext, &iv)) {
+        return false;
+      }
+
+      seq = util::endian::big<std::uint32_t>(header.sequenceNumber);
+      return !plaintext.empty();
+    }
+  }  // namespace mic
+
+  /**
+   * @brief Receive client microphone packets and play them into the host's virtual microphone.
+   *
+   * @param session Active streaming session that negotiated microphone passthrough.
+   */
+  void micThread(session_t *session) {
+    platf::set_thread_name("session::mic");
+
+    while_starting_do_nothing(session->state);
+
+    auto &ctx = *session->broadcast_ref;
+    auto session_id = session->audio.ping_payload;
+    auto queue = std::make_shared<mic_queue_t::element_type>(32);
+    {
+      auto lg = ctx.mic_queues.lock();
+      ctx.mic_queues->insert_or_assign(session_id, queue);
+    }
+    auto unregister = util::fail_guard([&]() {
+      queue->stop();
+
+      auto lg = ctx.mic_queues.lock();
+      if (auto it = ctx.mic_queues->find(session_id); it != std::end(*ctx.mic_queues) && it->second == queue) {
+        ctx.mic_queues->erase(it);
+      }
+    });
+
+    int opus_error;
+    std::unique_ptr<OpusDecoder, decltype(&opus_decoder_destroy)> decoder {
+      opus_decoder_create(SS_MIC_SAMPLE_RATE, SS_MIC_CHANNELS, &opus_error),
+      &opus_decoder_destroy
+    };
+    if (!decoder) {
+      BOOST_LOG(error) << "Microphone: couldn't create Opus decoder: "sv << opus_strerror(opus_error);
+      return;
+    }
+
+    crypto::cipher::gcm_t cipher {session->mic.key, false};
+
+    // The audio context must outlive the virtual microphone, so it's declared first
+    audio::audio_ctx_ref_t audio_ctx;
+    std::unique_ptr<platf::remote_mic_t> sink;
+    auto next_open_attempt = std::chrono::steady_clock::now();
+
+    auto open_sink = [&]() {
+      if (std::chrono::steady_clock::now() < next_open_attempt) {
+        return;
+      }
+
+      if (!audio_ctx) {
+        audio_ctx = audio::get_audio_ctx_ref();
+      }
+      if (audio_ctx && audio_ctx->control) {
+        sink = audio_ctx->control->remote_mic();
+      }
+
+      if (sink) {
+        BOOST_LOG(info) << "Microphone: client microphone connected to virtual microphone"sv;
+      } else {
+        BOOST_LOG(warning) << "Microphone: no virtual microphone is available. Install Steam or VB-Audio Virtual Cable on Windows."sv;
+        next_open_attempt = std::chrono::steady_clock::now() + 10s;
+      }
+    };
+
+    std::vector<float> pcm(mic::MAX_FRAME_SAMPLES);
+    auto play = [&](int samples) {
+      if (samples <= 0) {
+        return;
+      }
+      if (!sink) {
+        open_sink();
+        if (!sink) {
+          return;
+        }
+      }
+      if (sink->write(pcm.data(), samples) < 0) {
+        BOOST_LOG(warning) << "Microphone: virtual microphone failed, reopening it"sv;
+        sink.reset();
+        next_open_attempt = std::chrono::steady_clock::now() + 1s;
+      }
+    };
+
+    // Open the virtual microphone up front so it becomes the default recording
+    // device before applications start looking for a microphone.
+    open_sink();
+
+    BOOST_LOG(info) << "Microphone: passthrough active"sv;
+
+    std::vector<std::uint8_t> opus_packet;
+    std::optional<std::uint32_t> last_seq;
+    int last_frame_samples = SS_MIC_SAMPLE_RATE / 50;
+    std::uint64_t rejected_packets = 0;
+
+    while (!session->shutdown_event->peek()) {
+      auto packet = queue->pop(100ms);
+      if (!packet) {
+        continue;
+      }
+
+      std::uint32_t seq;
+      if (!mic::decrypt_packet(*packet, cipher, opus_packet, seq)) {
+        if (rejected_packets++ % 100 == 0) {
+          BOOST_LOG(warning) << "Microphone: rejected invalid packet"sv;
+        }
+        continue;
+      }
+
+      // Drop duplicate, reordered, and replayed packets. Late voice packets are useless anyway.
+      std::uint32_t lost = 0;
+      if (last_seq) {
+        auto delta = static_cast<std::int32_t>(seq - *last_seq);
+        if (delta <= 0) {
+          continue;
+        }
+        lost = static_cast<std::uint32_t>(delta) - 1;
+      }
+      last_seq = seq;
+
+      auto frame_samples = opus_packet_get_nb_samples(opus_packet.data(), (opus_int32) opus_packet.size(), SS_MIC_SAMPLE_RATE);
+      if (frame_samples <= 0 || frame_samples > mic::MAX_FRAME_SAMPLES) {
+        continue;
+      }
+
+      // Conceal short gaps: packet loss concealment for all but the last lost
+      // packet, which can be recovered from this packet's in-band FEC data.
+      if (lost > 0 && lost <= mic::MAX_CONCEALED_PACKETS) {
+        for (std::uint32_t i = 1; i < lost; ++i) {
+          play(opus_decode_float(decoder.get(), nullptr, 0, pcm.data(), last_frame_samples, 0));
+        }
+        play(opus_decode_float(decoder.get(), opus_packet.data(), (opus_int32) opus_packet.size(), pcm.data(), frame_samples, 1));
+      }
+
+      play(opus_decode_float(decoder.get(), opus_packet.data(), (opus_int32) opus_packet.size(), pcm.data(), (int) pcm.size(), 0));
+      last_frame_samples = frame_samples;
+    }
+
+    BOOST_LOG(info) << "Microphone: passthrough stopped"sv;
+  }
+
   namespace session {
     std::atomic_uint running_sessions;  ///< Running sessions.
 
@@ -2310,6 +2517,10 @@ namespace stream {
       session.videoThread.join();
       BOOST_LOG(debug) << "Waiting for audio to end..."sv;
       session.audioThread.join();
+      if (session.micThread.joinable()) {
+        BOOST_LOG(debug) << "Waiting for microphone to end..."sv;
+        session.micThread.join();
+      }
       BOOST_LOG(debug) << "Waiting for control to end..."sv;
       session.controlEnd.view();
       // Reset input on session stop to avoid stuck repeated keys
@@ -2370,6 +2581,12 @@ namespace stream {
 
       session.audioThread = std::jthread {audioThread, &session};
       session.videoThread = std::jthread {videoThread, &session};
+
+      // Microphone packets are routed by session ID, so they require ML_FF_SESSION_ID_V1
+      constexpr auto mic_flags = ML_FF_MICROPHONE_V1 | ML_FF_SESSION_ID_V1;
+      if (platf::remote_mic_supported && config::audio.mic_passthrough && (session.config.mlFeatureFlags & mic_flags) == mic_flags) {
+        session.micThread = std::jthread {micThread, &session};
+      }
 
       session.state.store(state_e::RUNNING, std::memory_order_relaxed);
 
@@ -2449,6 +2666,7 @@ namespace stream {
       };
 
       session->audio.ping_payload = launch_session.av_ping_payload;
+      session->mic.key = launch_session.gcm_key;
       session->audio.avRiKeyId = util::endian::big(*(std::uint32_t *) launch_session.iv.data());
       session->audio.sequenceNumber = 0;
       session->audio.timestamp = 0;

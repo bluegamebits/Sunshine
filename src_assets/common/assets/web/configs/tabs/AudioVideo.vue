@@ -87,6 +87,51 @@ const config = ref(props.config)
       </template>
     </PlatformLayout>
 
+    <PlatformLayout :platform="platform">
+      <template #windows>
+        <!-- Microphone Passthrough -->
+        <Checkbox class="mb-3"
+                  id="mic_passthrough"
+                  locale-prefix="config"
+                  v-model="config.mic_passthrough"
+                  default="true"
+        ></Checkbox>
+
+        <!-- Virtual Microphone Device -->
+        <div class="mb-3">
+          <label for="mic_device" class="form-label">{{ $t('config.mic_device') }}</label>
+          <input type="text" class="form-control" id="mic_device" :placeholder="$t('config.mic_device_placeholder')"
+                 v-model="config.mic_device" />
+          <div class="form-text">{{ $t('config.mic_device_desc') }}</div>
+        </div>
+
+        <!-- Use Client Microphone as Default -->
+        <Checkbox class="mb-3"
+                  id="mic_set_default"
+                  locale-prefix="config"
+                  v-model="config.mic_set_default"
+                  default="true"
+        ></Checkbox>
+      </template>
+      <template #linux>
+        <!-- Microphone Passthrough -->
+        <Checkbox class="mb-3"
+                  id="mic_passthrough"
+                  locale-prefix="config"
+                  v-model="config.mic_passthrough"
+                  default="true"
+        ></Checkbox>
+
+        <!-- Use Client Microphone as Default -->
+        <Checkbox class="mb-3"
+                  id="mic_set_default"
+                  locale-prefix="config"
+                  v-model="config.mic_set_default"
+                  default="true"
+        ></Checkbox>
+      </template>
+    </PlatformLayout>
+
     <AdapterNameSelector
         :platform="platform"
         :config="config"

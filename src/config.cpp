@@ -804,6 +804,9 @@ namespace config {
     true,  // stream audio
     true,  // install_steam_drivers
     false,  // external_audio
+    true,  // mic_passthrough
+    {},  // mic_device
+    true,  // mic_set_default
   };
 
   /**
@@ -1811,6 +1814,9 @@ namespace config {
     bool_f(vars, "stream_audio", audio.stream);
     bool_f(vars, "install_steam_audio_drivers", audio.install_steam_drivers);
     bool_f(vars, "external_audio", audio.external_audio);
+    bool_f(vars, "mic_passthrough", audio.mic_passthrough);
+    string_f(vars, "mic_device", audio.mic_device);
+    bool_f(vars, "mic_set_default", audio.mic_set_default);
 
     string_restricted_f(vars, "origin_web_ui_allowed", nvhttp.origin_web_ui_allowed, {"pc"sv, "lan"sv, "wan"sv});
 
